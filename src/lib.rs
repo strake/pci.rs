@@ -8,7 +8,6 @@
  * according to those terms.
  */
 
-#![feature(no_std)]
 #![no_std]
 
 //! PCI bus management
