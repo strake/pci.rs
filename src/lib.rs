@@ -10,6 +10,8 @@
 
 #![no_std]
 
+#![feature(asm)]
+
 //! PCI bus management
 //!
 //! This crate defines various traits, functions, and types for working with the PCI local bus.
@@ -29,58 +31,47 @@
 
 #[macro_use]
 extern crate bitflags;
+#[cfg(target_arch = "x86_64")]
+extern crate x86_64;
 
-/// A trait defining port I/O operations.
-///
-/// All port I/O operations are parametric over this trait. This allows operating systems to use
-/// this crate without modifications, by suitably instantiating this trait with their own
-/// primitives.
-pub trait PortOps {
-    unsafe fn read8(&self, port: u16) -> u8;
-    unsafe fn read16(&self, port: u16) -> u16;
-    unsafe fn read32(&self, port: u16) -> u32;
+#[cfg(target_arch = "x86_64")]
+pub const default_cspace_access_method: CSpaceAccessMethod = CSpaceAccessMethod::IO {
+    address_port: ::x86_64::instructions::port::Port::<u32>::new(0xCF8),
+       data_port: ::x86_64::instructions::port::Port::<u32>::new(0xCFC),
+};
 
-    unsafe fn write8(&self, port: u16, val: u8);
-    unsafe fn write16(&self, port: u16, val: u16);
-    unsafe fn write32(&self, port: u16, val: u32);
-}
-
-const CONFIG_ADDRESS: u16 = 0x0CF8;
-const CONFIG_DATA: u16 = 0x0CFC;
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CSpaceAccessMethod {
-    // The legacy, deprecated (as of PCI 2.0) IO-range method.
-    // Until/unless there is a relevant platform that requires this, leave it out.
-    // IO_Mechanism_2
     /// The legacy (pre-PCIe) 2-IO port method as specified on page 50 of PCI Local Bus
     /// Specification 3.0.
-    IO,
-    // PCIe memory-mapped configuration space access
+    #[cfg(target_arch = "x86_64")]
+    IO { address_port: ::x86_64::instructions::port::Port<u32>,
+            data_port: ::x86_64::instructions::port::Port<u32> },
+    ///// PCIe memory-mapped configuration space access
     //MemoryMapped(*mut u8),
 }
 
 // All IO-bus ops are 32-bit, we mask and shift to get the values we want.
 
 impl CSpaceAccessMethod {
-    pub unsafe fn read8<T: PortOps>(self, ops: &T, loc: Location, offset: u16) -> u8 {
-        let val = self.read32(ops, loc, offset & 0b11111100);
+    pub unsafe fn read8(&mut self, loc: Location, offset: u16) -> u8 {
+        let val = self.read32(loc, offset & 0b11111100);
         ((val >> ((offset as usize & 0b11) << 3)) & 0xFF) as u8
     }
 
     /// Returns a value in native endian.
-    pub unsafe fn read16<T: PortOps>(self, ops: &T, loc: Location, offset: u16) -> u16 {
-        let val = self.read32(ops, loc, offset & 0b11111100);
+    pub unsafe fn read16(&mut self, loc: Location, offset: u16) -> u16 {
+        let val = self.read32(loc, offset & 0b11111100);
         ((val >> ((offset as usize & 0b10) << 3)) & 0xFFFF) as u16
     }
 
     /// Returns a value in native endian.
-    pub unsafe fn read32<T: PortOps>(self, ops: &T, loc: Location, offset: u16) -> u32 {
+    pub unsafe fn read32(&mut self, loc: Location, offset: u16) -> u32 {
         debug_assert!((offset & 0b11) == 0, "misaligned PCI configuration dword u32 read");
         match self {
-            CSpaceAccessMethod::IO => {
-                ops.write32(CONFIG_ADDRESS, loc.encode() | ((offset as u32) & 0b11111100));
-                ops.read32(CONFIG_DATA).to_le()
+            CSpaceAccessMethod::IO { address_port, data_port } => {
+                address_port.write(loc.encode() | ((offset as u32) & 0b11111100));
+                data_port.read().to_le()
             },
             //MemoryMapped(ptr) => {
             //    // FIXME: Clarify whether the rules for GEP/GEPi forbid using regular .offset() here.
@@ -89,29 +80,29 @@ impl CSpaceAccessMethod {
         }
     }
 
-    pub unsafe fn write8<T: PortOps>(self, ops: &T, loc: Location, offset: u16, val: u8) {
-        let old = self.read32(ops, loc, offset);
+    pub unsafe fn write8(&mut self, loc: Location, offset: u16, val: u8) {
+        let old = self.read32(loc, offset);
         let dest = offset as usize & 0b11 << 3;
         let mask = (0xFF << dest) as u32;
-        self.write32(ops, loc, offset, ((val as u32) << dest | (old & !mask)).to_le());
+        self.write32(loc, offset, ((val as u32) << dest | (old & !mask)).to_le());
     }
 
     /// Converts val to little endian before writing.
-    pub unsafe fn write16<T: PortOps>(self, ops: &T, loc: Location, offset: u16, val: u16) {
-        let old = self.read32(ops, loc, offset);
+    pub unsafe fn write16(&mut self, loc: Location, offset: u16, val: u16) {
+        let old = self.read32(loc, offset);
         let dest = offset as usize & 0b10 << 3;
         let mask = (0xFFFF << dest) as u32;
-        self.write32(ops, loc, offset, ((val as u32) << dest | (old & !mask)).to_le());
+        self.write32(loc, offset, ((val as u32) << dest | (old & !mask)).to_le());
     }
 
     /// Takes a value in native endian, converts it to little-endian, and writes it to the PCI
     /// device configuration space at register `offset`.
-    pub unsafe fn write32<T: PortOps>(self, ops: &T, loc: Location, offset: u16, val: u32) {
+    pub unsafe fn write32(&mut self, loc: Location, offset: u16, val: u32) {
         debug_assert!((offset & 0b11) == 0, "misaligned PCI configuration dword u32 read");
         match self {
-            CSpaceAccessMethod::IO => {
-                ops.write32(CONFIG_ADDRESS, loc.encode() | (offset as u32 & 0b11111100));
-                ops.write32(CONFIG_DATA, val.to_le())
+            CSpaceAccessMethod::IO { address_port, data_port } => {
+                address_port.write(loc.encode() | (offset as u32 & 0b11111100));
+                data_port.write(val.to_le())
             },
             //MemoryMapped(ptr) => {
             //    // FIXME: Clarify whether the rules for GEP/GEPi forbid using regular .offset() here.
@@ -212,8 +203,8 @@ bitflags! {
 /// A device on the PCI bus.
 ///
 /// Although accessing configuration space may be expensive, it is not cached.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct PCIDevice {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Device {
     pub loc: Location,
     pub id: Identifier,
     pub command: Command,
@@ -227,6 +218,21 @@ pub struct PCIDevice {
     pub pic_interrupt_line: u8,
     pub interrupt_pin: Option<InterruptPin>,
     pub cspace_access_method: CSpaceAccessMethod,
+}
+
+impl Device {
+    #[inline]
+    pub unsafe fn cread8(&mut self, offset: u16) -> u8 { self.cspace_access_method.read8(self.loc, offset) }
+    #[inline]
+    pub unsafe fn cread16(&mut self, offset: u16) -> u16 { self.cspace_access_method.read16(self.loc, offset) }
+    #[inline]
+    pub unsafe fn cread32(&mut self, offset: u16) -> u32 { self.cspace_access_method.read32(self.loc, offset) }
+    #[inline]
+    pub unsafe fn cwrite8(&mut self, offset: u16, value: u8) { self.cspace_access_method.write8(self.loc, offset, value) }
+    #[inline]
+    pub unsafe fn cwrite16(&mut self, offset: u16, value: u16) { self.cspace_access_method.write16(self.loc, offset, value) }
+    #[inline]
+    pub unsafe fn cwrite32(&mut self, offset: u16, value: u32) { self.cspace_access_method.write32(self.loc, offset, value) }
 }
 
 pub enum PCIScanError {
@@ -317,11 +323,11 @@ pub enum BAR {
 }
 
 impl BAR {
-    pub unsafe fn decode<T: PortOps>(ops: &T, loc: Location, am: CSpaceAccessMethod, idx: u16) -> (Option<BAR>, usize) {
-        let raw = am.read32(ops, loc, 16 + (idx << 2));
-        am.write32(ops, loc, 16 + (idx << 2), !0);
-        let len_encoded = am.read32(ops, loc, 16 + (idx << 2));
-        am.write32(ops, loc, 16 + (idx << 2), raw);
+    pub unsafe fn decode(loc: Location, am: &mut CSpaceAccessMethod, idx: u16) -> (Option<BAR>, usize) {
+        let raw = am.read32(loc, 16 + (idx << 2));
+        am.write32(loc, 16 + (idx << 2), !0);
+        let len_encoded = am.read32(loc, 16 + (idx << 2));
+        am.write32(loc, 16 + (idx << 2), raw);
         if raw == 0 && len_encoded == 0 {
             return (None, idx as usize + 1);
         }
@@ -330,7 +336,7 @@ impl BAR {
             let base: u64 =
             match (raw & 0b110) >> 1 {
                 0 => (raw & !0xF) as u64,
-                2 => { bits64 = true; ((raw & !0xF) as u64) | ((am.read32(ops, loc, 16 + ((idx + 1) << 2)) as u64) << 32) }
+                2 => { bits64 = true; ((raw & !0xF) as u64) | ((am.read32(loc, 16 + ((idx + 1) << 2)) as u64) << 32) }
                 _ => { debug_assert!(false, "bad type in memory BAR"); return (None, idx as usize + 1) },
             };
             let len = !(len_encoded & !0xF) + 1;
@@ -344,19 +350,14 @@ impl BAR {
     }
 }
 
-pub struct BusScan<'a, T: PortOps+'a> {
+pub struct BusScan {
     loc: Location,
-    ops: &'a T,
     am: CSpaceAccessMethod,
 }
 
-impl<'a, T: PortOps> BusScan<'a, T> {
+impl BusScan {
     fn done(&self) -> bool {
-        if self.loc.bus == 255 && self.loc.device == 31 && self.loc.function == 7 {
-            true
-        } else {
-            false
-        }
+        self.loc.bus == 255 && self.loc.device == 31 && self.loc.function == 7
     }
 
     fn increment(&mut self) {
@@ -384,41 +385,37 @@ impl<'a, T: PortOps> BusScan<'a, T> {
     }
 }
 
-impl<'a, T: PortOps> ::core::iter::Iterator for BusScan<'a, T> {
-    type Item = PCIDevice;
+impl ::core::iter::Iterator for BusScan {
+    type Item = Device;
     #[inline]
-    fn next(&mut self) -> Option<PCIDevice> {
+    fn next(&mut self) -> Option<Device> {
         // FIXME: very naive atm, could be smarter and waste much less time by only scanning used
         // busses.
         let mut ret = None;
-        loop {
-            if self.done() {
-                return ret;
-            }
+        while !self.done() {
             unsafe {
-                ret = probe_function(self.ops, self.loc, self.am);
+                ret = probe_function(self.loc, self.am.clone());
             }
             self.increment();
-            if ret.is_some() {
-                return ret;
-            }
+            if ret.is_some() { break }
         }
+        ret
     }
 }
 
-pub unsafe fn probe_function<T: PortOps>(ops: &T, loc: Location, am: CSpaceAccessMethod) -> Option<PCIDevice> {
+pub unsafe fn probe_function(loc: Location, mut am: CSpaceAccessMethod) -> Option<Device> {
     // FIXME: it'd be more efficient to use read32 and decode separately.
-    let vid = am.read16(ops, loc, 0);
+    let vid = am.read16(loc, 0);
     if vid == 0xFFFF {
         return None;
     }
-    let did = am.read16(ops, loc, 2);
-    let command = Command::from_bits_truncate(am.read16(ops, loc, 4));
-    let status = Status::from_bits_truncate(am.read16(ops, loc, 6));
-    let rid = am.read8(ops, loc, 8);
-    let prog_if = am.read8(ops, loc, 9);
-    let subclass = am.read8(ops, loc, 10);
-    let class = am.read8(ops, loc, 11);
+    let did = am.read16(loc, 2);
+    let command = Command::from_bits_truncate(am.read16(loc, 4));
+    let status = Status::from_bits_truncate(am.read16(loc, 6));
+    let rid = am.read8(loc, 8);
+    let prog_if = am.read8(loc, 9);
+    let subclass = am.read8(loc, 10);
+    let class = am.read8(loc, 11);
     let id = Identifier {
         vendor_id: vid,
         device_id: did,
@@ -427,14 +424,14 @@ pub unsafe fn probe_function<T: PortOps>(ops: &T, loc: Location, am: CSpaceAcces
         class: class,
         subclass: subclass,
     };
-    let cache_line_size = am.read8(ops, loc, 12);
-    let latency_timer = am.read8(ops, loc, 13);
-    let bist_capable = am.read8(ops, loc, 15) & (1 << 7) != 0;
-    let hdrty_mf = am.read8(ops, loc, 14);
+    let cache_line_size = am.read8(loc, 12);
+    let latency_timer = am.read8(loc, 13);
+    let bist_capable = am.read8(loc, 15) & (1 << 7) != 0;
+    let hdrty_mf = am.read8(loc, 14);
     let hdrty = hdrty_mf & !(1 << 7);
     let mf = hdrty_mf & (1 << 7) != 0;
-    let pic_interrupt_line = am.read8(ops, loc, 0x3C);
-    let interrupt_pin = match am.read8(ops, loc, 0x3D) {
+    let pic_interrupt_line = am.read8(loc, 0x3C);
+    let interrupt_pin = match am.read8(loc, 0x3D) {
         1 => Some(InterruptPin::INTA),
         2 => Some(InterruptPin::INTB),
         3 => Some(InterruptPin::INTC),
@@ -448,65 +445,65 @@ pub unsafe fn probe_function<T: PortOps>(ops: &T, loc: Location, am: CSpaceAcces
         0 => {
             max = 6;
             kind = DeviceKind::Device(DeviceDetails {
-                cardbus_cis_ptr: am.read32(ops, loc, 0x28),
-                subsystem_vendor_id: am.read16(ops, loc, 0x2C),
-                subsystem_id: am.read16(ops, loc, 0x2E),
-                expansion_rom_base_addr: am.read32(ops, loc, 0x30),
-                min_grant: am.read8(ops, loc, 0x3E),
-                max_latency: am.read8(ops, loc, 0x3F),
+                cardbus_cis_ptr: am.read32(loc, 0x28),
+                subsystem_vendor_id: am.read16(loc, 0x2C),
+                subsystem_id: am.read16(loc, 0x2E),
+                expansion_rom_base_addr: am.read32(loc, 0x30),
+                min_grant: am.read8(loc, 0x3E),
+                max_latency: am.read8(loc, 0x3F),
             });
         },
         1 => {
             max = 2;
             kind = DeviceKind::PciBridge(PciBridgeDetails {
-                primary_bus: am.read8(ops, loc, 0x18),
-                secondary_bus: am.read8(ops, loc, 0x19),
-                subordinate_bus: am.read8(ops, loc, 0x1a),
-                secondary_latency_timer: am.read8(ops, loc, 0x1b),
-                secondary_status: Status::from_bits_truncate(am.read16(ops, loc, 0x1e)),
+                primary_bus: am.read8(loc, 0x18),
+                secondary_bus: am.read8(loc, 0x19),
+                subordinate_bus: am.read8(loc, 0x1a),
+                secondary_latency_timer: am.read8(loc, 0x1b),
+                secondary_status: Status::from_bits_truncate(am.read16(loc, 0x1e)),
                 io_base:
-                    (am.read8(ops, loc, 0x1c) as u32 & 0xF0) << 8
-                    | (am.read16(ops, loc, 0x30) as u32) << 16,
+                    (am.read8(loc, 0x1c) as u32 & 0xF0) << 8
+                    | (am.read16(loc, 0x30) as u32) << 16,
                 io_limit:
                     0xFFF
-                    | (am.read8(ops, loc, 0x1d) as u32 & 0xF0) << 8
-                    | (am.read16(ops, loc, 0x32) as u32) << 16,
-                mem_base: (am.read16(ops, loc, 0x20) as u32 & 0xFFF0) << 16,
+                    | (am.read8(loc, 0x1d) as u32 & 0xF0) << 8
+                    | (am.read16(loc, 0x32) as u32) << 16,
+                mem_base: (am.read16(loc, 0x20) as u32 & 0xFFF0) << 16,
                 mem_limit:
                     0xFFFFF
-                    | (am.read16(ops, loc, 0x22) as u32 & 0xFFF0) << 16,
+                    | (am.read16(loc, 0x22) as u32 & 0xFFF0) << 16,
                 prefetchable_mem_base:
-                    (am.read16(ops, loc, 0x24) as u64 & 0xFFF0) << 16
-                    | am.read32(ops, loc, 0x28) as u64,
+                    (am.read16(loc, 0x24) as u64 & 0xFFF0) << 16
+                    | am.read32(loc, 0x28) as u64,
                 prefetchable_mem_limit:
                     0xFFFFF
-                    | (am.read16(ops, loc, 0x26) as u64 & 0xFFF0) << 16
-                    | am.read32(ops, loc, 0x2c) as u64,
-                expansion_rom_base_addr: am.read32(ops, loc, 0x38),
-                bridge_control: BridgeControl::from_bits_truncate(am.read16(ops, loc, 0x3e)),
+                    | (am.read16(loc, 0x26) as u64 & 0xFFF0) << 16
+                    | am.read32(loc, 0x2c) as u64,
+                expansion_rom_base_addr: am.read32(loc, 0x38),
+                bridge_control: BridgeControl::from_bits_truncate(am.read16(loc, 0x3e)),
             });
         },
         2 => {
             max = 0;
             kind = DeviceKind::CardbusBridge(CardbusBridgeDetails {
-                socket_base_addr: am.read32(ops, loc, 0x10),
-                secondary_status: Status::from_bits_truncate(am.read16(ops, loc, 0x16)),
-                pci_bus: am.read8(ops, loc, 0x18),
-                cardbus_bus: am.read8(ops, loc, 0x19),
-                subordinate_bus: am.read8(ops, loc, 0x1a),
-                cardbus_latency_timer: am.read8(ops, loc, 0x1b),
-                mem_base_0: am.read32(ops, loc, 0x1c),
-                mem_limit_0: am.read32(ops, loc, 0x20),
-                mem_base_1: am.read32(ops, loc, 0x24),
-                mem_limit_1: am.read32(ops, loc, 0x28),
-                io_base_0: am.read32(ops, loc, 0x2c),
-                io_limit_0: am.read32(ops, loc, 0x30),
-                io_base_1: am.read32(ops, loc, 0x34),
-                io_limit_1: am.read32(ops, loc, 0x38),
-                bridge_control: BridgeControl::from_bits_truncate(am.read16(ops, loc, 0x3e)),
-                subsystem_device_id: am.read16(ops, loc, 0x40),
-                subsystem_vendor_id: am.read16(ops, loc, 0x42),
-                legacy_mode_base_addr: am.read32(ops, loc, 0x44),
+                socket_base_addr: am.read32(loc, 0x10),
+                secondary_status: Status::from_bits_truncate(am.read16(loc, 0x16)),
+                pci_bus: am.read8(loc, 0x18),
+                cardbus_bus: am.read8(loc, 0x19),
+                subordinate_bus: am.read8(loc, 0x1a),
+                cardbus_latency_timer: am.read8(loc, 0x1b),
+                mem_base_0: am.read32(loc, 0x1c),
+                mem_limit_0: am.read32(loc, 0x20),
+                mem_base_1: am.read32(loc, 0x24),
+                mem_limit_1: am.read32(loc, 0x28),
+                io_base_0: am.read32(loc, 0x2c),
+                io_limit_0: am.read32(loc, 0x30),
+                io_base_1: am.read32(loc, 0x34),
+                io_limit_1: am.read32(loc, 0x38),
+                bridge_control: BridgeControl::from_bits_truncate(am.read16(loc, 0x3e)),
+                subsystem_device_id: am.read16(loc, 0x40),
+                subsystem_vendor_id: am.read16(loc, 0x42),
+                legacy_mode_base_addr: am.read32(loc, 0x44),
             });
         },
         _ => {
@@ -519,12 +516,12 @@ pub unsafe fn probe_function<T: PortOps>(ops: &T, loc: Location, am: CSpaceAcces
     let mut bars = [None, None, None, None, None, None];
     let mut i = 0;
     while i < max {
-        let (bar, next) = BAR::decode(ops, loc, am, i as u16);
+        let (bar, next) = BAR::decode(loc, &mut am, i as u16);
         bars[i] = bar;
         i = next;
     }
 
-    Some(PCIDevice {
+    Some(Device {
         loc: loc,
         id: id,
         command: command,
@@ -541,6 +538,6 @@ pub unsafe fn probe_function<T: PortOps>(ops: &T, loc: Location, am: CSpaceAcces
     })
 }
 
-pub unsafe fn scan_bus<'a, T: PortOps>(ops: &'a T, am: CSpaceAccessMethod) -> BusScan<'a, T> {
-    BusScan { loc: Location { bus: 0, device: 0, function: 0 }, ops: ops, am: am }
+pub unsafe fn scan_bus(am: CSpaceAccessMethod) -> BusScan {
+    BusScan { loc: Location { bus: 0, device: 0, function: 0 }, am }
 }
